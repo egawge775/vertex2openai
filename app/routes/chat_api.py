@@ -165,7 +165,7 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
         # 命中在用的缓冲：已出结果的直接重放；上游还在算的，等同一个后台泵的结果。
         print(f"↩️ [重放命中] {stream_id}（{id_src}）：直接返回已缓冲的完整回复，不再请求上游。")
         if buf.payload is None:
-            await buf.wait_for(2 ** 62, 600.0)
+            await buf.wait_for(2 ** 62, 900.0)
         if buf.payload is None:
             return JSONResponse(
                 status_code=504,
@@ -206,7 +206,7 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
 
     # 当前连接等待缓冲完成（等同于原来的直通等待；断线不影响后台泵）。
     # wait_for(seq=极大值) 等价于“等到 done 或超时”。
-    await buf.wait_for(2 ** 62, 600.0)
+    await buf.wait_for(2 ** 62, 900.0)
     if buf.payload is None:
         return JSONResponse(
             status_code=504,

@@ -122,6 +122,16 @@ Thumbs.db
 # Credentials
 # Ignore the entire credentials directory by default
 credentials/
+# 批量登录脚本用的账号文件（明文密码 / TOTP 密钥，严禁入库）
+users.txt
+users-*.txt
+users.csv
+users-*.csv
+accounts*.txt
+accounts*.csv
+# 登录脚本产物（里面有登录结果，同样严禁入库）
+login-results/
+configs/auth/
 # 运行态持久化文件（包含控制台保存的 Cookie / Project ID 等敏感信息，严禁入库）
 web_state.json
 app/web_state.json

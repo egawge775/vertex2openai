@@ -1,0 +1,15 @@
+# 登录脚本依赖（node_modules 体积大且可按 package.json 复现）
+node_modules/
+package-lock.json
+
+# 本项目自带的 Camoufox 浏览器（~1GB，跑 npm run setup-browser 自动下载，不入库）
+camoufox/
+camoufox-linux/
+camoufox-macos/
+
+# 登录产物：账号列表 / 结果 / 登录态 —— 全是凭证，绝不入库
+../login-results/
+../configs/auth/
+../logs/
+*.csv
+*.txt
