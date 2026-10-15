@@ -15,7 +15,7 @@ from routes import models_api, chat_api
 
 from logger import rt_logger, stats
 import config
-from runtime_state import app_state
+from runtime_state import app_state, describe_state_file
 import model_capabilities as mc
 from model_loader import get_express_models
 
@@ -59,6 +59,26 @@ async def lifespan(app: FastAPI):
     # 多账号 Express Key：环境变量只做**一次性**初始导入，之后以控制台保存的列表为准。
     # （用户在控制台把列表清空并保存后，这里不会再把环境变量里的 Key 复种回来。）
     app_state.import_env_express_keys_once(config.VERTEX_EXPRESS_API_KEY_VAL)
+
+    # 状态文件落点诊断：Key / Cookie 全在这个文件里。PaaS 容器重建会清空工作目录，
+    # 没配持久卷就会出现「重启后 Key 全没了」，必须让人一眼看见。
+    _sf = describe_state_file()
+    _paas = any(os.environ.get(k) for k in ("ZEABUR", "RAILWAY_ENVIRONMENT", "RENDER", "DYNO"))
+    if _sf["explicit"]:
+        print(f"💾 [持久化] 状态文件：{_sf['path']}"
+              f"（来自 STATE_DIR={os.environ.get('STATE_DIR')}；"
+              f"{'已存在' if _sf['exists'] else '首次启动，将在保存时创建'}）")
+        if not _sf["writable"]:
+            print(f"🔴 [持久化] STATE_DIR 目录不可写：{_sf['dir']} —— "
+                  "Key / Cookie 保存会失败，请检查卷的权限。")
+    else:
+        print(f"⚠️ [持久化] 未设置 STATE_DIR，状态文件落在工作目录：{_sf['path']}")
+        if _paas:
+            print("🔴 [持久化] 检测到 PaaS 环境（Zeabur / Railway / Render 等）且未挂载持久卷："
+                  "容器每次重启都会清空工作目录，Express Key 与 Cookie 都会丢失！\n"
+                  "            请在服务的「硬盘 / Volumes」页挂载一个卷（如 /data），"
+                  "并设置环境变量 STATE_DIR=/data 后重新部署。详见 README。")
+
     if express_key_manager.get_total_keys() > 0:
         print(f"✅ [密钥配置] 已加载 {express_key_manager.get_total_keys()} 个 Express API Key。")
     else:
@@ -392,13 +412,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div id="h_keys" class="helpbox">
-        <b>热编辑</b>：增删改后点「保存 Key 列表」立即生效，<b>不需要重启服务</b>。列表存在 <code>web_state.json</code>（文件权限 0600）。<br>
+        <b>热编辑</b>：增删改后点「保存 Key 列表」立即生效，<b>不需要重启服务</b>。列表存在状态文件 <code>web_state.json</code>（文件权限 0600），<b>实际落点见上方绿色/红色提示</b>。<br>
+        <b>⚠️ 部署在 Zeabur / Railway 等 PaaS 上</b>：容器重启会清空工作目录。必须挂载持久卷并设 <code>STATE_DIR</code> 指向它，否则重启后 Key 与 Cookie 全会丢失（页面上的红色提示会告诉你当前是否已正确持久化）。<br>
         <b>Project ID</b>：每个 Key 属于不同的谷歌账号/项目，标准模式的 location 钉定会用<b>这个 Key 自己的项目</b>拼资源路径 <code>projects/{project}/locations/{location}/...</code>，不再共用 Cookie 通道那份全局 Project ID。<br>
         启动时自动探测填入（用不存在的模型名调一次 generateContent，从上游 404 错误信息里解析项目，不消耗配额；来源显示 <code>auto</code>）；也可点每行的「探测」单独重探，或直接手填（来源变 <code>manual</code>，探测不会覆盖手填值）。<br>
         探测失败不影响调用：拿不到项目就退回全局 Project ID，再退回裸模型名（旧行为）。<br>
         <b>环境变量</b> <code>VERTEX_EXPRESS_API_KEY</code> 只在<b>首次启动</b>时一次性导入这里；此后以本列表为准——<b>把列表清空并保存后，重启也不会被环境变量复种</b>。<br>
         <b>明文显示</b>：本列表按需要明文展示 Key（控制台本身有密码保护）；运行日志里只打掩码。
       </div>
+      <div id="keys-persist" class="text-xs rounded-lg px-3 py-2 mt-1 mb-2" style="display:none"></div>
       <div id="keys-list" class="space-y-2"></div>
       <p id="keys-empty" class="text-xs text-neutral-500 mt-2 hidden">当前没有任何 Express Key。点「＋ 添加 Key」粘贴一个，再点「保存 Key 列表」。</p>
     </div>
@@ -825,7 +847,33 @@ async function loadExpressKeys(){
     const d=await (await fetch('/api/express-keys')).json();
     KEYS=(d.keys||[]).map(r=>Object.assign({},r));
     renderKeys();
+    renderPersist(d.persist);
   }catch(e){}
+}
+function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function renderPersist(p){
+  const el=$('keys-persist'); if(!el) return;
+  if(!p || !p.path){ el.style.display='none'; return; }
+  el.style.display='block';
+  if(p.explicit && p.writable){
+    el.style.background='#f0fdf4'; el.style.color='#166534';
+    el.innerHTML='💾 <b>状态文件</b>：<code>'+esc(p.path)+'</code>'
+      +'（来自 STATE_DIR，已挂载持久存储）—— Key / Cookie 重启后不会丢。';
+    return;
+  }
+  el.style.background='#fef2f2'; el.style.color='#991b1b';
+  let why;
+  if(!p.explicit){
+    why='未设置环境变量 <code>STATE_DIR</code>，该文件落在容器的<b>临时</b>工作目录';
+  }else if(!p.writable){
+    why='<code>STATE_DIR</code> 指向的目录<b>不可写</b>，保存会直接失败';
+  }else{
+    why='配置存在异常，建议检查';
+  }
+  el.innerHTML='🔴 <b>重启后 Key / Cookie 会丢失</b>：'+why+'。<br>'
+    +'当前落点：<code>'+esc(p.path)+'</code><br>'
+    +'修复：在服务的「硬盘 / Volumes」页挂载一个卷（如 <code>/data</code>），'
+    +'并设置环境变量 <code>STATE_DIR=/data</code> 后重新部署。';
 }
 async function saveExpressKeys(){
   const payload=collectKeys();
@@ -833,7 +881,7 @@ async function saveExpressKeys(){
   try{
     const r=await fetch('/api/express-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keys:payload})});
     const d=await r.json();
-    if(r.ok){ KEYS=(d.keys||[]).map(x=>Object.assign({},x)); renderKeys(); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); }
+    if(r.ok){ KEYS=(d.keys||[]).map(x=>Object.assign({},x)); renderKeys(); renderPersist(d.persist); toast('已保存 '+KEYS.length+' 个 Key（已热生效）'); }
     else toast('❌ '+(d.error||'保存失败'));
   }catch(e){ toast('❌ 网络请求失败'); }
 }
@@ -1255,6 +1303,8 @@ def _express_keys_payload() -> dict:
         "enabled": sum(1 for r in records if r.get("enabled", True)),
         "roundrobin": bool(app_state.get_setting("roundrobin", config.ROUNDROBIN)),
         "env_import_done": True,
+        # 状态文件落点：让用户自己确认「重启后 Key 会不会丢」
+        "persist": describe_state_file(),
     }
 
 

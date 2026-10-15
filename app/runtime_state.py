@@ -8,8 +8,37 @@ import time
 import config as app_config
 
 # S-3：允许把状态落到挂载卷，避免 docker compose 重建后设置与 Cookie 全部丢失。
+# PaaS（Zeabur / Railway / Render 等）容器重建会清空工作目录，必须显式设 STATE_DIR
+# 指向挂载的持久卷目录，否则每次重启都会回到「默认设置 + 没有 Key」。
 STATE_DIR = os.environ.get("STATE_DIR", ".")
 STATE_FILE = os.path.join(STATE_DIR, "web_state.json")
+# 用户是否显式配置过 STATE_DIR（没配就落在工作目录 = 容器重建即丢）
+STATE_DIR_EXPLICIT = "STATE_DIR" in os.environ
+
+
+def describe_state_file() -> dict:
+    """状态文件落点诊断（启动日志与控制台展示用）。
+
+    存在的意义：Key / Cookie 全部存在这个文件里，而它在 PaaS 上默认落在**临时**的
+    工作目录，重启即丢。给出绝对路径 + 是否显式配置，能让人一眼判断"配没配持久化"，
+    不用靠猜。
+    """
+    abspath = os.path.abspath(STATE_FILE)
+    target_dir = os.path.dirname(abspath)
+    # 目录还没建时 os.access 会返回 False（会误报"不可写"），要先上溯到最近的已存在祖先目录
+    probe = target_dir
+    while probe and not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    return {
+        "path": abspath,
+        "dir": target_dir,
+        "explicit": STATE_DIR_EXPLICIT,
+        "exists": os.path.exists(STATE_FILE),
+        "writable": bool(probe) and os.access(probe, os.W_OK),
+    }
 
 
 class AppState:

@@ -374,7 +374,13 @@ async def pump_stream(buf: ResumableBuffer, body_iterator: AsyncIterator[Any]) -
     except Exception as e:
         msg = f"{type(e).__name__} - {e}"
         print(f"❌ [续传缓冲] {buf.id} 上游读取失败：{msg}")
-        err = {"error": {"message": str(e)[:1024], "type": "upstream_error", "code": 500}}
+        # 限流类（含被包装成 500 的 RESOURCE_EXHAUSTED）如实报 429，别让下游把限流当渠道故障
+        from api_helpers import classify_upstream_error
+        _err_code, _err_type = classify_upstream_error(
+            getattr(e, "code", None) or getattr(e, "status_code", None) or 500, e)
+        err = {"error": {"message": str(e)[:1024],
+                         "type": _err_type if _err_type != "server_error" else "upstream_error",
+                         "code": _err_code}}
         await buf.append(frame_with_id(buf.next_seq, f"data: {json.dumps(err, ensure_ascii=False)}\n\n"))
         await buf.append(frame_with_id(buf.next_seq, DONE_FRAME))
         await buf.finish("error", error=msg)

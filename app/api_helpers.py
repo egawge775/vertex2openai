@@ -159,32 +159,163 @@ def create_openai_error_response(status_code: int, message: str, error_type: str
         }
     }
 
+def _text_has(e: Any, *keywords: str) -> bool:
+    """异常文本里是否出现任一关键词（小写匹配，None 安全）。"""
+    if e is None:
+        return False
+    low = str(e).lower()
+    return any(k in low for k in keywords)
+
+
+def is_rate_limit_error(e: Any) -> bool:
+    """错误是否属于「上游限流」类（429 Resource Exhausted、配额用尽）。
+
+    只看**结构化字段**与**明确的限流语义**，不做 "429" in str 这种子串猜测：
+    形如 `status_code=500, 429 RESOURCE_EXHAUSTED` 的包装串里同时含 500 和 429，
+    纯子串匹配无法判断该信哪个。
+
+    本函数只认「限流」，不认「传输层失败」：`503 UNAVAILABLE`（上游过载）由
+    classify_upstream_error 的结构化 503 分支覆盖，`ConnectionError` 之类则交给
+    is_transport_error —— 两者都报 429 会让下游把「节点挂了」当成「限流冷却」。
+    """
+    if e is None:
+        return False
+    for attr in ("code", "status_code"):
+        val = getattr(e, attr, None)
+        if isinstance(val, int) and val in (429, 502, 503):
+            return True
+    resp = getattr(e, "response", None)
+    if resp is not None and getattr(resp, "status_code", None) in (429, 502, 503):
+        return True
+    low = str(e).lower()
+    # 注意：这里**不放** "timeout" / "unavailable" —— 它们属于传输层（见 is_transport_error），
+    # 放进来会让「连不上上游」被误判成限流 429（关键字撞车的经典坑）。
+    # 上游过载的 `503 UNAVAILABLE` 由上面的结构化 503 分支覆盖，不靠字符串匹配。
+    return any(k in low for k in (
+        "resource_exhausted", "resource exhausted",
+        "rate limit", "ratelimit", "too many requests", "quota",
+    ))
+
+
+def is_transport_error(e: Any) -> bool:
+    """错误是否是「网络/连接层」失败（连不上节点、超时、代理挂了、TLS 失败）。
+
+    这类失败**是临时的**，必须和「渠道本身有问题」区分开：连不上上游时若报 500，
+    下游网关（new-api/one-api）会当成渠道故障处理；而实际上换个节点/等一会就能用。
+    """
+    if e is None:
+        return False
+    if isinstance(e, (
+        httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
+        httpx.WriteTimeout, httpx.PoolTimeout, httpx.ProxyError,
+        httpx.RemoteProtocolError, httpx.NetworkError, httpx.TransportError,
+    )):
+        return True
+    name = type(e).__name__.lower()
+    if any(k in name for k in (
+        "timeout", "connecterror", "connectionerror", "proxyerror",
+        "networkerror", "remoteprotocol", "ssl", "certificate",
+    )):
+        return True
+    low = str(e).lower()
+    return any(k in low for k in (
+        "connection attempts failed", "connection reset", "connection refused",
+        "connect timeout", "timed out", "timeout", "temporary failure in name resolution",
+        "name or service not known", "ssl", "certificate verify failed",
+        "proxy", "network is unreachable", "unreachable",
+        "unavailable", "overloaded",
+    ))
+
+
+def classify_upstream_error(code: int, e: Any = None) -> tuple[int, str]:
+    """把上游状态码规整成「客户端按语义可正确处置」的 (状态码, OpenAI 错误 type)。
+
+    核心动机：**限流必须如实报 429**。改造前重试耗尽后一律吐 500，下游
+    （new-api / one-api / 各类轮询网关）会把 500 当成「渠道故障」，于是禁用渠道、
+    切换渠道甚至告警——而真实情况只是暂时限流，等几秒就能用。
+    报 429 则触发它们的限流冷却逻辑，稍后重试即可恢复。
+
+    - 429 / 502 / 503（含 RESOURCE_EXHAUSTED、过载、配额）→ 统一 **429 rate_limit_error**，
+      并按 HTTP 语义对 502/503 做一次兼容（503 语义等同"稍后重试"，归到 429 让网关退避）。
+    - 网络/连接层失败（节点挂、代理不通、超时）→ **503 upstream_unavailable**。
+      同样属于临时故障，新 API 的 shouldRetry 对 5xx（504/524 除外）会重试，
+      但 ShouldDisableChannel 不认 503，所以不会把渠道打成「已禁用」。
+    - 404 → not_found，403 → permission_error，400 → invalid_request_error。
+    - 其余 5xx/未知 → 原样返回，type 用 server_error。
+
+    ⚠️ **判定顺序很关键**：必须先看「异常本身说了什么」（限流语义 → 传输层语义），
+    再用传入的状态码兜底。若反过来先信状态码，`503` 会被下面的语义分支再扭成 429，
+    而 `extract_upstream_error` 恰好会把已算好的 503 再喂进来一次 —— 自污染成 429。
+    """
+    if is_rate_limit_error(e):
+        return 429, "rate_limit_error"
+    # 504 要在传输层判定**之前**判：`504 Deadline Exceeded` 的文案里带 "deadline"，
+    # 若先走 is_transport_error 会被归成 503（可重试），而新 API 明确不对 504 重试
+    # （避免把慢请求打成重试雪崩），因此这里保留 504 语义。
+    if code == 504 or _text_has(e, "504", "deadline exceeded"):
+        return 504, "upstream_timeout"
+    if is_transport_error(e):
+        return 503, "upstream_unavailable"
+    if code in (429, 502, 503):
+        # 裸 502（无 .code 属性）是典型的网关/连接层失败，归到传输层；
+        # 上游真的回了 502 且带 .code=502 时才算限流拥堵（见上方 is_rate_limit_error）。
+        if code == 502 and getattr(e, "code", None) is None:
+            return 503, "upstream_unavailable"
+        return 429, "rate_limit_error"
+    if code == 404:
+        return 404, "not_found"
+    if code in (401, 403):
+        return code, "permission_error"
+    if code == 400:
+        return 400, "invalid_request_error"
+    if isinstance(code, int) and 500 <= code <= 599:
+        return code, "server_error"
+    return (code if isinstance(code, int) and 400 <= code <= 599 else 500), "server_error"
+
+
 def extract_upstream_error(e: Exception) -> tuple[int, str]:
     """从上游异常里尽力提取 (HTTP 状态码, 简明消息)。
 
     google-genai 的 ClientError/ServerError 带 .code 与结构化 message；
     其余异常回退 500 + 类名+摘要。用于把 404/403/400 等如实透传给客户端，
     避免笼统的 500 Internal Server Error。
+
+    ⚠️ 限流兜底：SDK 抛出的 `429 RESOURCE_EXHAUSTED` 重试耗尽后必须仍报 429
+    （不能退化成 500），否则下游网关会误判为渠道故障。见 classify_upstream_error。
     """
     code = getattr(e, "code", None) or getattr(e, "status_code", None)
     msg = str(e)
-    # 从形如 "{'error': {'code':404,'message':...}}" 的 message 里提取更干净的说明
-    try:
-        m = re.search(r"'message':\s*'([^']+)'", msg) or re.search(r'"message":\s*"([^"]+)"', msg)
-        if m:
-            msg = m.group(1)
-    except Exception:
-        pass
+    # 从形如 "{'error': {'code':404,'message':...}}" 的 message 里提取更干净的说明。
+    # 注意：**自带 <状态码>, <错误码> <错误枚举>.** 前缀的消息（google-genai 的
+    # `status_code=500, 429 RESOURCE_EXHAUSTED. {...}` 就是这种）保持原样不截断——
+    # 这行前缀正是下游网关后台里唯一能看到的状态码线索，截掉它会让 429 的问题
+    # 在日志里彻底失去可诊断性（正文只剩 "Resource exhausted. Please try again later."）。
+    if not re.match(r"^\s*(status_code=|status\s*=|\[\d{3}\])", msg):
+        try:
+            m = re.search(r"'message':\s*'([^']+)'", msg) or re.search(r'"message":\s*"([^"]+)"', msg)
+            if m:
+                msg = m.group(1)
+        except Exception:
+            pass
     if not isinstance(code, int) or not (400 <= code <= 599):
         low = str(e).lower()
+        if is_rate_limit_error(e):
+            return 429, msg
         if "not found" in low or "404" in low:
-            code = 404
-        elif "permission" in low or "403" in low or "denied" in low:
-            code = 403
-        elif "invalid" in low or "400" in low:
-            code = 400
-        else:
-            code = 500
+            return 404, msg
+        if "permission" in low or "403" in low or "denied" in low:
+            return 403, msg
+        if "invalid" in low or "400" in low:
+            return 400, msg
+        if _text_has(e, "504", "deadline exceeded"):
+            return 504, msg
+        if is_transport_error(e):
+            # 连不上上游（节点挂/代理不通/超时）→ 503：临时故障，不该被当成渠道故障。
+            # ⚠️ 必须直接返回，不能把 503 再喂给 classify_upstream_error —— 那是自污染：
+            # 503 在那边又会走 "code in (429,502,503) → 429" 分支，传输层语义被抹掉。
+            return 503, msg
+        return 500, msg
+    code, _ = classify_upstream_error(code, e)
     return code, msg
 
 
@@ -902,7 +1033,14 @@ async def gemini_fake_stream_generator(
         print(f"❌ [API 错误响应] 假流发生器运行崩溃 (Model: {request_obj.model})。错误详情: {err_msg_detail}")
         sse_err_msg_display = str(e_outer_gemini)
         if len(sse_err_msg_display) > 512: sse_err_msg_display = sse_err_msg_display[:512] + "..."
-        err_resp_sse = create_openai_error_response(500, sse_err_msg_display, "server_error")
+        # 限流必须如实报 429（不能一律 500），否则下游网关会误判成渠道故障并禁用渠道
+        _outer_code, _outer_type = classify_upstream_error(
+            getattr(e_outer_gemini, "code", None)
+            or getattr(e_outer_gemini, "status_code", None)
+            or 500,
+            e_outer_gemini,
+        )
+        err_resp_sse = create_openai_error_response(_outer_code, sse_err_msg_display, _outer_type)
         json_payload_error = json.dumps(err_resp_sse)
         if not is_auto_attempt:
             yield f"data: {json_payload_error}\n\n"
@@ -1105,7 +1243,14 @@ async def execute_gemini_call(
                         if has_yielded:
                             yield "data: [DONE]\n\n"
                         else:
-                            err_resp = create_openai_error_response(500, s_err, "server_error")
+                            # 重试耗尽后仍失败：限流类如实报 429（详见 classify_upstream_error）
+                            _st_code, _st_type = classify_upstream_error(
+                                getattr(e_stream_call, "code", None)
+                                or getattr(e_stream_call, "status_code", None)
+                                or 500,
+                                e_stream_call,
+                            )
+                            err_resp = create_openai_error_response(_st_code, s_err, _st_type)
                             yield f"data: {json.dumps(err_resp)}\n\n"
                             yield "data: [DONE]\n\n"
                         return

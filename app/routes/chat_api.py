@@ -184,10 +184,13 @@ async def _resumable_json(fastapi_request: Request, request_obj: OpenAIRequest, 
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             print(f"❌ [响应缓冲] {stream_id} 上游调用失败：{msg[:200]}")
-            await buf.finish("error", error=msg,
-                             payload={"error": {"message": str(e)[:1024],
-                                                 "type": "upstream_error", "code": 500}},
-                             status_code=500)
+            # 限流类报 429（而不是一律 500），避免下游网关误判渠道故障
+            err_code, err_msg = extract_upstream_error(e)
+            await buf.finish("error", error=err_msg,
+                             payload={"error": {"message": err_msg[:1024],
+                                                "type": "rate_limit_error" if err_code == 429 else "upstream_error",
+                                                "code": err_code}},
+                             status_code=err_code)
             return
         body = getattr(resp, "body", b"") or b""
         status = getattr(resp, "status_code", 200)

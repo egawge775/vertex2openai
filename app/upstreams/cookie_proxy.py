@@ -42,7 +42,7 @@ from message_processing import (
     _requires_signature,
 )
 from logger import stats
-from api_helpers import get_retry_settings
+from api_helpers import get_retry_settings, classify_upstream_error
 from signature_store import SignatureRecord, SignatureState, signature_store
 from schema_validation import SchemaValidationError, validate_request_schemas
 
@@ -1914,8 +1914,16 @@ class CookieProxyUpstream(BaseUpstream):
                     elapsed = time.time() - start_time
                     print(f"❌ [Studio] {base_model_name} | 异常 | {elapsed:.1f}s: {err_msg[:150]}")
                     traceback.print_exc()
-                    return JSONResponse(status_code=500, content={
-                        "error": {"message": f"batchGraphql proxy error: {err_msg}", "type": "proxy_error"}
+                    # 限流/拥堵类（含包装成 500 的 RESOURCE_EXHAUSTED）如实报 429，
+                    # 让 new-api 等下游网关走「限流冷却」而不是「渠道故障禁用」。
+                    _e_code, _e_type = classify_upstream_error(
+                        getattr(e, "code", None) or getattr(e, "status_code", None) or 500, e)
+                    return JSONResponse(status_code=_e_code, content={
+                        "error": {
+                            "message": f"batchGraphql proxy error: {err_msg}",
+                            "type": _e_type if _e_type != "server_error" else "proxy_error",
+                            "code": _e_code,
+                        }
                     })
 
             elapsed = time.time() - start_time

@@ -45,6 +45,62 @@ Vertex2OpenAI 是一个 **OpenAI API 兼容代理**。它对外提供 OpenAI 风
   - **断连即停**：客户端断开后立即停止上游调用与重试。
 - **中文运行日志**：密钥轮询、上游调用、重试退避、权限报错、Token 统计等均为中文实时说明。
 
+## 状态持久化（PaaS 部署必读：重启后 Key 消失怎么修）
+
+**症状**：在 Zeabur / Railway / Render 等平台部署，重启服务后发现控制台里填的 Express API Key 全没了。
+
+**原因**：Key、Cookie、全部控制台设置都存在**一个文件**里 —— `web_state.json`，位置由
+`STATE_DIR` 决定，**默认是进程工作目录（容器内 `/app`）**。PaaS 的容器文件系统是**临时的**，
+重启 / 重新部署会整个重建，文件随之消失。
+
+### 修复：挂持久卷 + 指向它
+
+以 Zeabur 为例（[官方文档](https://zeabur.com/docs/zh-CN/data-management/volumes)）：
+
+1. 打开该服务的页面 → **「硬盘 / Volumes」** 分页 → **Mount Volumes**
+2. 填两个字段：
+   - **Volume ID**：随便起个名字，如 `vertex-data`（只是标识，与挂载结果无关）
+   - **Mount Directory**：填 **`/data`**
+3. 到服务 → **「环境变量」**，新增：
+
+```text
+STATE_DIR=/data
+```
+
+4. 重新部署。
+
+完成后状态文件就是 `/data/web_state.json`，重启、重新部署、换镜像都不再丢。
+
+> ⚠️ **挂载的那一瞬间，该目录原有内容会被清空**（Zeabur 明确说明）。所以先挂卷再填 Key，
+> 别反过来；如果 `/data` 里已有别的东西，先下载备份。
+>
+> ⚠️ 挂载 Volume 后该服务**不再支持零停机重启**，每次重启会有短暂中断。
+
+### 怎么确认已经生效
+
+- **看启动日志**（现在会明确打印）：
+  ```text
+  💾 [持久化] 状态文件：/data/web_state.json（来自 STATE_DIR=/data；首次启动，将在保存时创建）
+  ```
+  没配的话会打印红色警告：
+  ```text
+  🔴 [持久化] 检测到 PaaS 环境（Zeabur / Railway / Render 等）且未挂载持久卷：
+     容器每次重启都会清空工作目录，Express Key 与 Cookie 都会丢失！
+  ```
+- **看控制台**：「通道与凭证」页的 Key 列表上方会有一条提示 —— 绿色＝已正确持久化（带实际路径），
+  红色＝重启会丢（并给出修复步骤）。
+
+### 连带陷阱：环境变量不会替你把 Key 补回来
+
+`VERTEX_EXPRESS_API_KEY` **只在首次启动时做一次性导入**。只要你曾经点过控制台的
+「保存 Key 列表」（哪怕存的是空列表），就会打上 `express_keys_initialized` 标记，
+之后**再也不会从环境变量重新导入**。
+
+所以「重启后 Key 消失」时，即使你环境变量里还留着那个 Key，**服务也不会自己恢复**，
+必须重新在控制台填一次。这也是为什么持久化必须提前配好，而不是等丢了再补救。
+
+---
+
 ## 快速开始（本地 Docker）
 
 编辑 `docker-compose.yml`，设置初始环境变量：
@@ -84,7 +140,7 @@ http://localhost:8050
 | `GOOGLE_COOKIE` | 否 | 空 | Cookie 直连模式的 Google Cookie（初始值，后续可在控制台更新）。 |
 | `GOOGLE_PROJECT_ID` | 否 | 空 | Cookie 直连模式的 Project ID（初始值，后续可在控制台更新）。 |
 | `EXPERIMENT_FLAGS` | 否 | 空 | 可选：batchGraphql 的 `experimentFlagsBinary`，一般无需设置。 |
-| `STATE_DIR` | 否 | `.` | `web_state.json` 的存放目录。用 Docker 时请指向挂载卷，否则重建容器会丢失全部设置与 Cookie。 |
+| `STATE_DIR` | 否 | `.`（当前工作目录） | `web_state.json` 的存放目录。**PaaS 部署必须指向挂载的持久卷**（如 `/data`），否则重启后 Key / Cookie / 设置全部丢失，详见上方「状态持久化」。用 Docker 时指向挂载卷即可。 |
 | `ALLOW_DEFAULT_KEY` | 否 | 空 | 仅用于在公开托管环境（如 HF Space）临时放行默认 `API_KEY`，正常部署不要设置。 |
 
 > 提示：`ROUNDROBIN`、`FAKE_STREAMING(_INTERVAL)`、`SAFETY_SCORE` 等环境变量仅作为**初始值**，运行时以控制台设置为准。
