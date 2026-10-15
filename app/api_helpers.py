@@ -167,6 +167,31 @@ def _text_has(e: Any, *keywords: str) -> bool:
     return any(k in low for k in keywords)
 
 
+def is_empty_upstream_content_error(e: Any) -> bool:
+    """错误是否是「上游返回了空内容」（有 candidate 但 parts 为 0 / candidates 为 0）。
+
+    实测症状（非流式路径，模型如 gemini-4-argon）：
+        Agent Platform 非流式响应无有效内容，模型：projects/…/models/gemini-4-argon。
+        Candidates: 1. Has content. Parts: 0.
+
+    这是**上游抽风**（模型这次什么都没产出来），不是渠道坏了、也不是入参不合法：
+      - 报 500 → 下游网关（new-api / one-api）当成「渠道故障」，禁用渠道、切渠道甚至告警；
+      - 报 400 → 客户端会以为是自己请求写错了，改参数也无济于事。
+    所以归到 429（限流/拥堵语义），让下游按「稍后重试 + 退避」处理，等下一次上游正常即可。
+
+    只认这两段**明确的文案**，避免把别的异常误伤成 429。
+    """
+    if e is None:
+        return False
+    low = str(e).lower()
+    if "无有效内容" in str(e) or "empty response" in low or "no valid content" in low:
+        return True
+    # 形如 "Candidates: 0." / "Parts: 0."（带句点的诊断串）
+    if re.search(r"candidates:\s*0\s*\.", low) or re.search(r"parts:\s*0\s*\.", low):
+        return True
+    return False
+
+
 def is_rate_limit_error(e: Any) -> bool:
     """错误是否属于「上游限流」类（429 Resource Exhausted、配额用尽）。
 
@@ -247,6 +272,10 @@ def classify_upstream_error(code: int, e: Any = None) -> tuple[int, str]:
     再用传入的状态码兜底。若反过来先信状态码，`503` 会被下面的语义分支再扭成 429，
     而 `extract_upstream_error` 恰好会把已算好的 503 再喂进来一次 —— 自污染成 429。
     """
+    # ⚠️ 空回复（上游返回 candidate 但 parts=0）最先判：即使调用方传进来 500、异常自带 code=500，
+    # 也必须是 429 —— 那是上游这次没产出内容（临时抽风），报 500 会被下游当成渠道故障禁用渠道。
+    if is_empty_upstream_content_error(e):
+        return 429, "rate_limit_error"
     if is_rate_limit_error(e):
         return 429, "rate_limit_error"
     # 504 要在传输层判定**之前**判：`504 Deadline Exceeded` 的文案里带 "deadline"，
@@ -282,6 +311,9 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
 
     ⚠️ 限流兜底：SDK 抛出的 `429 RESOURCE_EXHAUSTED` 重试耗尽后必须仍报 429
     （不能退化成 500），否则下游网关会误判为渠道故障。见 classify_upstream_error。
+
+    ⚠️ 空回复兜底：上游返回 candidate 但 parts=0（"非流式响应无有效内容"）同样归 429，
+    即使异常自带 500 也覆盖掉 —— 那是上游抽风，不是渠道故障。见 is_empty_upstream_content_error。
     """
     code = getattr(e, "code", None) or getattr(e, "status_code", None)
     msg = str(e)
@@ -297,6 +329,13 @@ def extract_upstream_error(e: Exception) -> tuple[int, str]:
                 msg = m.group(1)
         except Exception:
             pass
+    # ⚠️ 空回复（上游返回了 candidate 但 parts=0）必须优先判成 429，**即使异常自带 5xx 状态码**：
+    # 实测这类 ValueError 有时被包装成 status_code=500 抛上来，若让下面的
+    # "500 <= code <= 599 → 原样返回 server_error" 生效，下游网关就会把
+    # 「上游这次没产出内容」当成渠道故障并禁用渠道。
+    if is_empty_upstream_content_error(e):
+        return 429, msg
+
     if not isinstance(code, int) or not (400 <= code <= 599):
         low = str(e).lower()
         if is_rate_limit_error(e):

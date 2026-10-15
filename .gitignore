@@ -28,6 +28,7 @@ MANIFEST
 
 # Python virtualenv
 .venv/
+.venv-test/
 env/
 venv/
 ENV/

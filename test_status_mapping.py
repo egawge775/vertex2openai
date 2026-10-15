@@ -22,6 +22,13 @@ REAL_MSG = (
     "'status': 'RESOURCE_EXHAUSTED'}}"
 )
 
+# 线上实测的「空回复」报错：上游返回了 candidate，但 parts 为 0（模型这次什么都没产出来）
+EMPTY_CONTENT_MSG = (
+    "Agent Platform 非流式响应无有效内容，模型："
+    "projects/473670929683/locations/global/publishers/google/models/gemini-4-argon。"
+    "Candidates: 1. Has content. Parts: 0."
+)
+
 
 class FakeAPIError(Exception):
     """模拟 google.genai.errors.APIError：带 .code 属性与完整 message。"""
@@ -46,6 +53,11 @@ CASES = [
     ("400 参数非法",
      FakeAPIError(400, "400 INVALID_ARGUMENT. Requests ending with a model turn"), 400),
     ("真·未知错误（保持 500）", Exception("some unexpected internal bug"), 500),
+    # ⭐ 空回复：上游这次没产出内容（candidate 在但 parts=0）。
+    # 报 500 会被下游网关当成渠道故障而禁用渠道；归 429 让它退避重试。
+    ("空回复（裸 ValueError，无 code）", Exception(EMPTY_CONTENT_MSG), 429),
+    ("空回复（被包装成 code=500）", FakeAPIError(500, EMPTY_CONTENT_MSG), 429),
+    ("空回复（Candidates: 0 形态）", Exception("Candidates: 0. "), 429),
     ("连不上上游（节点挂 / 代理不通）", Exception("All connection attempts failed"), 503),
     ("连接超时", Exception("ConnectTimeout: timed out"), 503),
     ("上游超时", Exception("504 Deadline Exceeded"), 504),
